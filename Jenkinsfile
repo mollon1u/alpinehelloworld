@@ -20,7 +20,8 @@ pipeline {
             steps {
                script {
                  sh '''
-		    docker rm -f eazytraining/$IMAGE_NAME:$IMAGE_TAG
+		    docker stop $IMAGE_NAME 
+		    docker rm $IMAGE_NAME 
                     docker run --name $IMAGE_NAME -d -p 80:5000 -e PORT=5000 eazytraining/$IMAGE_NAME:$IMAGE_TAG
                     sleep 5
                  '''
