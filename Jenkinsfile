@@ -1,117 +1,89 @@
-def CONTAINER_NAME = "calculator"
-def ENV_NAME = getEnvName(env.BRANCH_NAME)
-def CONTAINER_TAG = getTag(env.BUILD_NUMBER, env.BRANCH_NAME)
-def HTTP_PORT = getHTTPPort(env.BRANCH_NAME)
-def EMAIL_RECIPIENTS = "antoine.mollon@telecomnancy.net"
-
-
-node {
-    try {
-        stage('Initialize') {
-            def dockerHome = tool 'DockerLatest'
-            def mavenHome = tool 'MavenLatest'
-            env.PATH = "${dockerHome}/bin:${mavenHome}/bin:${env.PATH}"
-        }
-
-        stage('Checkout') {
-            checkout scm
-        }
-
-        stage('Build with test') {
-
-            sh "mvn clean install"
-        }
-
-        stage('Sonarqube Analysis') {
-            withSonarQubeEnv('SonarQubeLocalServer') {
-                sh " mvn sonar:sonar -Dintegration-tests.skip=true -Dmaven.test.failure.ignore=true"
-            }
-            timeout(time: 1, unit: 'MINUTES') {
-                def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
-                if (qg.status != 'OK') {
-                    error "Pipeline aborted due to quality gate failure: ${qg.status}"
+pipeline {
+     environment {
+       IMAGE_NAME = "alpinehelloworld"
+       IMAGE_TAG = "latest"
+       STAGING = "eazytraining-staging"
+       PRODUCTION = "eazytraining-production"
+     }
+     agent none
+     stages {
+         stage('Build image') {
+             agent any
+             steps {
+                script {
+                  sh 'docker build -t eazytraining/$IMAGE_NAME:$IMAGE_TAG .'
                 }
+             }
+        }
+        stage('Run container based on builded image') {
+            agent any
+            steps {
+               script {
+                 sh '''
+                    docker run --name $IMAGE_NAME -d -p 80:5000 -e PORT=5000 eazytraining/$IMAGE_NAME:$IMAGE_TAG
+                    sleep 5
+                 '''
+               }
             }
-        }
-
-        stage("Image Prune") {
-            imagePrune(CONTAINER_NAME)
-        }
-
-        stage('Image Build') {
-            imageBuild(CONTAINER_NAME, CONTAINER_TAG)
-        }
-
-        stage('Push to Docker Registry') {
-            withCredentials([usernamePassword(credentialsId: 'DockerhubCredentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-                pushToImage(CONTAINER_NAME, CONTAINER_TAG, USERNAME, PASSWORD)
+       }
+       stage('Test image') {
+           agent any
+           steps {
+              script {
+                sh '''
+                    curl http://localhost | grep -q "Hello world!"
+                '''
+              }
+           }
+      }
+      stage('Clean Container') {
+          agent any
+          steps {
+             script {
+               sh '''
+                 docker stop $IMAGE_NAME
+                 docker rm $IMAGE_NAME
+               '''
+             }
+          }
+     }
+     stage('Push image in staging and deploy it') {
+       when {
+              expression { GIT_BRANCH == 'origin/master' }
             }
+      agent any
+      environment {
+          HEROKU_API_KEY = credentials('heroku_api_key')
+      }  
+      steps {
+          script {
+            sh '''
+              heroku container:login
+              heroku create $STAGING || echo "project already exist"
+              heroku container:push -a $STAGING web
+              heroku container:release -a $STAGING web
+            '''
+          }
         }
-
-        stage('Run App') {
-            withCredentials([usernamePassword(credentialsId: 'DockerhubCredentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-                runApp(CONTAINER_NAME, CONTAINER_TAG, USERNAME, HTTP_PORT, ENV_NAME)
-
+     }
+     stage('Push image in production and deploy it') {
+       when {
+              expression { GIT_BRANCH == 'origin/master' }
             }
+      agent any
+      environment {
+          HEROKU_API_KEY = credentials('heroku_api_key')
+      }  
+      steps {
+          script {
+            sh '''
+              heroku container:login
+              heroku create $PRODUCTION || echo "project already exist"
+              heroku container:push -a $PRODUCTION web
+              heroku container:release -a $PRODUCTION web
+            '''
+          }
         }
-
-    } finally {
-        deleteDir()
-        sendEmail(EMAIL_RECIPIENTS);
-    }
-
-}
-
-def imagePrune(containerName) {
-    try {
-        sh "docker image prune -f"
-        sh "docker stop $containerName"
-    } catch (ignored) {
-    }
-}
-
-def imageBuild(containerName, tag) {
-    sh "docker build -t $containerName:$tag  -t $containerName --pull --no-cache ."
-    echo "Image build complete"
-}
-
-def pushToImage(containerName, tag, dockerUser, dockerPassword) {
-    sh "docker login -u $dockerUser -p $dockerPassword"
-    sh "docker tag $containerName:$tag $dockerUser/$containerName:$tag"
-    sh "docker push $dockerUser/$containerName:$tag"
-    echo "Image push complete"
-}
-
-def runApp(containerName, tag, dockerHubUser, httpPort, envName) {
-    sh "docker pull $dockerHubUser/$containerName"
-    sh "docker run --rm --env SPRING_ACTIVE_PROFILES=$envName -d -p $httpPort:$httpPort --name $containerName $dockerHubUser/$containerName:$tag"
-    echo "Application started on port: ${httpPort} (http)"
-}
-
-def sendEmail(recipients) {
-    mail(
-            to: recipients,
-            subject: "Build ${env.BUILD_NUMBER} - ${currentBuild.currentResult} - (${currentBuild.fullDisplayName})",
-            body: "Check console output at: ${env.BUILD_URL}/console" + "\n")
-}
-
-String getEnvName(String branchName) {
-    if (branchName == 'main') {
-        return 'prod'
-    }
-    return (branchName == 'develop') ? 'uat' : 'dev'
-}
-
-String getHTTPPort(String branchName) {
-    if (branchName == 'main') {
-        return '9003'
-    }
-    return (branchName == 'develop') ? '9002' : '9001'
-}
-
-String getTag(String buildNumber, String branchName) {
-    if (branchName == 'main') {
-        return buildNumber + '-unstable'
-    }
-    return buildNumber + '-stable'
+     }
+  }
 }
